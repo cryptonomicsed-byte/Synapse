@@ -20,7 +20,22 @@ import {
   SEED_NEGOTIATIONS,
   SEED_TRUST_EDGES,
   SEED_TASK_TEMPLATES,
+  hydrateSeedAgents,
+  AGENT_NAME_INDEX,
 } from './seed';
+import { buildAndSign, deriveKeypair } from './signing';
+import { publishToRelay } from './relay';
+
+// Per-session keypair cache: agent name → derived keypair.
+// Keyed by NAME (stable seed) not by pubkey (which changes after hydration).
+const _keypairCache = new Map<string, { privKeyHex: string; pubKeyHex: string; npub: string }>();
+
+async function keypairForAgent(agent: { pubkey: string; name: string }): Promise<{ privKeyHex: string; pubKeyHex: string }> {
+  if (_keypairCache.has(agent.name)) return _keypairCache.get(agent.name)!;
+  const kp = await deriveKeypair(agent.name);
+  _keypairCache.set(agent.name, kp);
+  return kp;
+}
 
 const KIND_LABELS: Record<number, string> = {
   30000: 'SKILL_CARD',
@@ -32,31 +47,6 @@ const KIND_LABELS: Record<number, string> = {
   30006: 'INTENT',
 };
 
-function mockEventId(seed: string): string {
-  let h = 0;
-  for (let i = 0; i < seed.length; i++) h = (h * 131 + seed.charCodeAt(i)) >>> 0;
-  let hex = '';
-  let s = h;
-  for (let i = 0; i < 16; i++) {
-    s = (s * 1103515245 + 12345) & 0x7fffffff;
-    hex += ((s >> 4) & 0xf).toString(16);
-  }
-  return 'evt_' + hex;
-}
-
-// Mock signature-style hash. This is NOT a real Schnorr signature — it's a
-// deterministic LCG hash used only for display. See NIPS/30-synapse.md §6.
-function mockSig(seed: string): string {
-  let h = 0;
-  for (let i = 0; i < seed.length; i++) h = (h * 9176 + seed.charCodeAt(i)) >>> 0;
-  let hex = '';
-  let s = h;
-  for (let i = 0; i < 32; i++) {
-    s = (s * 1103515245 + 12345) & 0x7fffffff;
-    hex += ((s >> 4) & 0xf).toString(16);
-  }
-  return hex;
-}
 
 function pickAssignee(step: string, agents: Agent[]): string {
   const s = step.toLowerCase();
@@ -129,6 +119,7 @@ export interface SynapseState {
   activeTaskId: string | null;
   tick: number;
   running: boolean;
+  hydrated: boolean; // true once real BIP-340 pubkeys are in place
   // selectors
   getAgent: (pubkey: string) => Agent | undefined;
   getSkill: (id: string) => SkillCard | undefined;
@@ -143,7 +134,7 @@ export interface SynapseState {
     tags?: string[][],
     summary?: string,
     kindLabel?: string,
-  ) => void;
+  ) => Promise<void>;
   setActiveTask: (id: string | null) => void;
 }
 
@@ -160,20 +151,72 @@ export const useSynapse = create<SynapseState>((set, get) => ({
   activeTaskId: null,
   tick: 0,
   running: false,
+  hydrated: false,
 
   getAgent: (pubkey) => get().agents.find((a) => a.pubkey === pubkey),
   getSkill: (id) => get().skills.find((s) => s.id === id),
 
   start: () => {
     if (timer) return;
-    const agents = get().agents;
-    const initialTasks = SEED_TASK_TEMPLATES.slice(0, 2).map((t, i) =>
-      buildTaskFromTemplate(t, agents, i),
-    );
-    set({ tasks: initialTasks, activeTaskId: initialTasks[0]?.id ?? null, running: true });
-    timer = setInterval(() => {
-      get().advance();
-    }, 1600);
+
+    // Hydrate real BIP-340 pubkeys, then kick the simulation.
+    void (async () => {
+      const agents = get().agents;
+      let hydratedAgents = agents;
+      try {
+        hydratedAgents = await hydrateSeedAgents(agents);
+      } catch (e) {
+        console.warn('[Synapse/store] Keypair hydration failed — running with placeholder pubkeys.', e);
+      }
+
+      // Re-link skills / memories / negotiations / trust edges that reference
+      // old placeholder pubkeys to the new real pubkeys.
+      const oldToNew = new Map<string, string>();
+      for (let i = 0; i < agents.length; i++) {
+        if (agents[i].pubkey !== hydratedAgents[i].pubkey) {
+          oldToNew.set(agents[i].pubkey, hydratedAgents[i].pubkey);
+        }
+      }
+      const relink = (pk: string) => oldToNew.get(pk) ?? pk;
+
+      const newSkills = get().skills.map((s) => ({ ...s, publisher: relink(s.publisher) }));
+      const newMemories = get().memories.map((m) => ({
+        ...m,
+        publisher: relink(m.publisher),
+        decryptors: m.decryptors.map(relink),
+      }));
+      const newNegotiations = get().negotiations.map((n) => ({
+        ...n,
+        requester: relink(n.requester),
+        provider: relink(n.provider),
+        history: n.history.map((h) => ({ ...h, from: relink(h.from) })),
+      }));
+      const newEdges = get().trustEdges.map((e) => ({
+        ...e,
+        from: relink(e.from),
+        to: relink(e.to),
+      }));
+
+      const initialTasks = SEED_TASK_TEMPLATES.slice(0, 2).map((t, i) =>
+        buildTaskFromTemplate(t, hydratedAgents, i),
+      );
+
+      set({
+        agents: hydratedAgents,
+        skills: newSkills,
+        memories: newMemories,
+        negotiations: newNegotiations,
+        trustEdges: newEdges,
+        tasks: initialTasks,
+        activeTaskId: initialTasks[0]?.id ?? null,
+        running: true,
+        hydrated: true,
+      });
+
+      timer = setInterval(() => {
+        get().advance();
+      }, 1600);
+    })();
   },
 
   stop: () => {
@@ -186,38 +229,49 @@ export const useSynapse = create<SynapseState>((set, get) => ({
 
   setActiveTask: (id) => set({ activeTaskId: id }),
 
-  publishEvent: (kind, pubkey, content, tags = [], summary, kindLabel) => {
-    const id = mockEventId(content + kind + Date.now() + Math.random());
+  publishEvent: async (kind, pubkey, content, tags = [], summary, kindLabel) => {
+    // Look up the agent by pubkey to get its name (the stable signing seed).
+    const agent = get().agents.find((a) => a.pubkey === pubkey);
+    const kp = agent
+      ? await keypairForAgent(agent)
+      : await deriveKeypair(pubkey); // fallback: derive from pubkey string
+    const signed = await buildAndSign(
+      { privKeyHex: kp.privKeyHex, pubKeyHex: kp.pubKeyHex, npub: agent?.npub ?? ('npub1' + kp.pubKeyHex.slice(0, 8)) },
+      kind, tags, content,
+    );
     const evt: SynapseEvent = {
-      id,
-      kind,
-      pubkey,
-      createdAt: Date.now(),
-      tags,
-      content,
-      sig: mockSig(content + pubkey + kind),
+      id:        signed.id,
+      kind:      signed.kind,
+      pubkey:    signed.pubkey,
+      createdAt: signed.created_at * 1000,
+      tags:      signed.tags,
+      content:   signed.content,
+      sig:       signed.sig,
     };
     const entry: FeedEntry = {
-      id,
+      id: signed.id,
       event: evt,
       kindLabel: kindLabel ?? KIND_LABELS[kind] ?? `KIND_${kind}`,
       summary: summary ?? content.slice(0, 120),
     };
     set((s) => ({ feed: [entry, ...s.feed].slice(0, 80) }));
+
+    // E-29: forward every signed event to the Nostr relay transport (fail-open)
+    void publishToRelay(signed);
   },
 
   advance: () => {
     set((state) => ({ tick: state.tick + 1 }));
     const state = get();
 
-    // Helper: publish + return
+    // Helper: fire-and-forget async publish (advance() is synchronous by contract)
     const publish = (
       pubkey: string,
       content: string,
       kind: number,
       summary?: string,
       tags?: string[][],
-    ) => get().publishEvent(kind, pubkey, content, tags ?? [], summary);
+    ) => { void get().publishEvent(kind, pubkey, content, tags ?? [], summary); };
 
     // ── Side-channel liveliness: occasionally advance a negotiation ──
     if (Math.random() < 0.22) {

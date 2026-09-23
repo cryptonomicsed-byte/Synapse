@@ -6,21 +6,40 @@ import type {
   TrustEdge,
   Task,
 } from './types';
+import { deriveKeypair } from './signing';
 
-// Deterministic mock keypair generation so it looks Nostr-authentic.
-function mockKeypair(seed: string): { pubkey: string; npub: string } {
-  let h = 0;
-  for (let i = 0; i < seed.length; i++) {
-    h = (h * 31 + seed.charCodeAt(i)) >>> 0;
+// ── Stable placeholder pubkey ─────────────────────────────────────────────────
+//
+// Seeds are agent names.  The placeholder is a deterministic 64-char hex string
+// derived with a simple FNV-1a-inspired mix — NOT a BIP-340 key, but stable
+// across restarts so cross-references within this file remain consistent.
+//
+// The store calls `hydrateSeedAgents()` on startup to replace every placeholder
+// with the real secp256k1 BIP-340 x-only pubkey produced by `deriveKeypair()`.
+
+function placeholderPubkey(name: string): string {
+  // FNV-1a 64-bit (two 32-bit halves) stretched to 64 hex chars
+  let lo = 0x811c9dc5;
+  let hi = 0x27d4eb2f;
+  for (let i = 0; i < name.length; i++) {
+    const c = name.charCodeAt(i);
+    lo ^= c; lo = Math.imul(lo, 0x01000193) >>> 0;
+    hi ^= (c << 4); hi = Math.imul(hi, 0x01000193) >>> 0;
   }
-  let hex = '';
-  let s = h;
-  for (let i = 0; i < 64; i++) {
-    s = (s * 1103515245 + 12345) & 0x7fffffff;
-    hex += ((s >> 4) & 0xf).toString(16);
+  const hex = (n: number) => n.toString(16).padStart(8, '0');
+  // stretch to 64 chars by mixing with index-salted rounds
+  let out = '';
+  let a = lo, b = hi;
+  for (let round = 0; round < 4; round++) {
+    a = (Math.imul(a ^ b, 0x9e3779b9) + round) >>> 0;
+    b = (Math.imul(b ^ a, 0x85ebca6b) + round) >>> 0;
+    out += hex(a) + hex(b);
   }
-  const npub = 'npub1' + hex.slice(0, 12) + '…' + hex.slice(-6);
-  return { pubkey: hex, npub };
+  return out; // 64 hex chars
+}
+
+function makePlaceholderNpub(pubkey: string): string {
+  return 'npub1' + pubkey.slice(0, 8) + '…' + pubkey.slice(-4);
 }
 
 function makeAgent(
@@ -33,10 +52,10 @@ function makeAgent(
   endorsements: number,
   hue: number,
 ): Agent {
-  const { pubkey, npub } = mockKeypair(name);
+  const pubkey = placeholderPubkey(name);
   return {
     pubkey,
-    npub,
+    npub: makePlaceholderNpub(pubkey),
     name,
     kind,
     bio,
@@ -47,6 +66,26 @@ function makeAgent(
     hue,
     bornAt: Date.now() - (60 * 60 * 1000 * (180 + (trustScore % 90))),
   };
+}
+
+// ── Async hydration ───────────────────────────────────────────────────────────
+//
+// Called once at store startup.  Replaces placeholder pubkeys with real
+// BIP-340 secp256k1 x-only public keys derived from the agent's name via
+// HKDF-SHA256.  The `agentNameIndex` map lets the store's keypairFor() look up
+// the signing key by agent name rather than by the (now-real) pubkey.
+
+export const AGENT_NAME_INDEX = new Map<string, string>(); // name → real pubkey (populated by hydrate)
+
+export async function hydrateSeedAgents(agents: Agent[]): Promise<Agent[]> {
+  const hydrated = await Promise.all(
+    agents.map(async (a) => {
+      const kp = await deriveKeypair(a.name);
+      AGENT_NAME_INDEX.set(a.name, kp.pubKeyHex);
+      return { ...a, pubkey: kp.pubKeyHex, npub: kp.npub };
+    }),
+  );
+  return hydrated;
 }
 
 export const SEED_AGENTS: Agent[] = [

@@ -11,7 +11,7 @@ export type AgentKind =
   | 'scout';
 
 export interface Agent {
-  pubkey: string;        // hex, mock Nostr-style
+  pubkey: string;        // hex, BIP-340 x-only secp256k1 (Nostr pubkey)
   npub: string;          // bech32-style display
   name: string;
   kind: AgentKind;
@@ -38,7 +38,7 @@ export interface SynapseEvent {
   createdAt: number;
   tags: string[][];
   content: string;
-  sig: string; // mock signature
+  sig: string; // BIP-340 Schnorr signature (64 bytes hex)
 }
 
 export interface SkillCard {

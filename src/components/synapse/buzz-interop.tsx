@@ -26,7 +26,7 @@ const BUZZ_PRIMITIVES = [
     icon: KeyRound,
     title: 'Agent Keypairs & Audit Trails',
     buzz: 'Agents are cryptographic peers with their own keypairs; every action is signed and auditable.',
-    synapse: 'Synapse inherits Buzz keypairs verbatim. Skill cards, memory shards, endorsements, and negotiations are all signed by the agent\u2019s existing Buzz keypair — no new identity layer. (v0.1 demo uses mock signatures; see NIPS/30-synapse.md §6 for the production Schnorr spec.)',
+    synapse: 'Synapse inherits Buzz keypairs verbatim. Skill cards, memory shards, endorsements, and negotiations are all signed by the agent\u2019s keypair using real BIP-340 Schnorr signatures via nostr-tools. Keys are derived from agent names via HKDF-SHA256; supply NOSTR_PRIVKEY (64-hex) to override the primary agent key.',
   },
   {
     icon: MessagesSquare,

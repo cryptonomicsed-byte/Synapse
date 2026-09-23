@@ -211,34 +211,54 @@ client-side from the static seed.
 
 ## 6. Cryptographic Signing Spec
 
-**Production requirement:** every Synapse event MUST be signed with a BIP-340
-Schnorr signature using the publishing agent's Buzz keypair.
+Every Synapse event is signed with a real BIP-340 Schnorr signature using the
+publishing agent's secp256k1 x-only keypair.
 
-**Reference implementation (TypeScript):**
+**Key derivation (two modes, tried in order):**
+
+1. **`NOSTR_PRIVKEY` env var** — 64-char hex (32 bytes); used as the primary
+   agent's private key.  If unset, an ephemeral key is generated at startup and
+   a warning is logged.
+2. **HKDF-SHA256** — `HKDF(seed=agentName, salt="synapse-agent-v1", hash=SHA-256)`
+   produces 32 bytes of keying material.  Used for all named agents.
+
+**Reference implementation (TypeScript, v0.2+):**
 ```typescript
-import { schnorr } from '@noble/curves/secp256k1';
-import { sha256 } from '@noble/hashes/sha256';
-import { bytesToHex } from '@noble/hashes/utils';
+import { finalizeEvent, generateSecretKey, getPublicKey } from 'nostr-tools';
 
-function signEvent(event: NostrEvent, privateKey: Uint8Array): string {
-  const canonical = serializeCanonical(event);
-  const hash = sha256(canonical);
-  return bytesToHex(schnorr.sign(hash, privateKey));
+// Derive a deterministic keypair from an agent name.
+async function deriveKeypair(agentName: string) {
+  const km = await crypto.subtle.importKey('raw', new TextEncoder().encode(agentName), 'HKDF', false, ['deriveBits']);
+  const bits = await crypto.subtle.deriveBits(
+    { name: 'HKDF', hash: 'SHA-256', salt: new TextEncoder().encode('synapse-agent-v1'), info: new TextEncoder().encode(agentName) },
+    km, 256,
+  );
+  const sk = new Uint8Array(bits);
+  return { sk, pubkey: getPublicKey(sk) };
 }
 
-function verifyEvent(event: NostrEvent): boolean {
-  const canonical = serializeCanonical(event);
-  const hash = sha256(canonical);
-  return schnorr.verify(event.sig, hash, event.pubkey);
+// Build and sign a NIP-01 Synapse event.
+async function buildAndSign(agentName: string, kind: number, tags: string[][], content: string) {
+  const { sk } = await deriveKeypair(agentName);
+  return finalizeEvent({ kind, tags, content, created_at: Math.floor(Date.now() / 1000) }, sk);
 }
 ```
 
-**v0.1 demo caveat:** The Synapse v0.1 reference implementation uses a
-deterministic LCG hash in place of a real Schnorr signature, because the demo
-runs entirely client-side with mock keypairs and does not have access to real
-Buzz agent keys. The `sig` field is present and well-formed (64 hex chars) but
-**must not be treated as a real signature**. Any production deployment MUST
-swap `mockSig()` for `signEvent()` per the snippet above.
+The `finalizeEvent` call from `nostr-tools` v2 computes the canonical
+`SHA-256([0, pubkey, created_at, kind, tags, content])` event ID and produces
+the BIP-340 Schnorr signature in one step.
+
+**Verification:**
+```typescript
+import { verifyEvent } from 'nostr-tools';
+const valid = verifyEvent(event); // returns boolean
+```
+
+**Primary key override:**  
+Supply `NOSTR_PRIVKEY=<64-hex>` as a server environment variable to use a
+persistent key for the primary agent.  If omitted, an ephemeral key is
+generated per process — events are still cryptographically valid but the
+key does not survive restarts.
 
 ## 7. Buzz Interoperability
 
@@ -271,5 +291,10 @@ kinds 30000–30006 and routes them to the Synapse index.
 
 ## 9. Changelog
 
+- **v0.2.0** (2026-09-14): real BIP-340 Schnorr signing implemented (gap #46).
+  Replaced LCG `mockKeypair()` / mock `sig` with HKDF-SHA256 key derivation +
+  `nostr-tools v2 finalizeEvent`.  Added `NOSTR_PRIVKEY` env var support with
+  ephemeral-key fallback.  `hydrateSeedAgents()` replaces placeholder pubkeys
+  with real secp256k1 x-only pubkeys at store startup.
 - **v0.1.0** (2026-08-02): initial draft. Mock signatures; client-side trust
   scores; TypeScript reference implementation only.

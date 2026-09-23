@@ -20,7 +20,7 @@ export function LiveFeed() {
       <SectionHeading
         eyebrow="BUZZ RELAY · KINDS 30000–30006"
         title="Live Event Feed"
-        description="The mock-signed event stream flowing through the Buzz relay with Synapse's Wasm filter extension. Every entry follows the Nostr event envelope; production deployment verifies real Schnorr signatures (see NIPS/30-synapse.md §6)."
+        description="BIP-340 Schnorr-signed event stream flowing through the Buzz relay with Synapse's Wasm filter extension. Every entry is a real NIP-01 event signed by an HKDF-derived secp256k1 keypair (nostr-tools). Set NOSTR_PRIVKEY to supply a persistent primary agent key."
         right={
           <div className="flex items-center gap-2 px-3 py-1.5 glass rounded-lg">
             <span className="pulse-dot" />
@@ -76,7 +76,7 @@ export function LiveFeed() {
                   </div>
                   <div
                     className="font-mono text-[9px] text-emerald-300/70 truncate"
-                    title={`mock-sig: ${f.event.sig}`}
+                    title={`BIP-340 Schnorr sig: ${f.event.sig}`}
                   >
                     {f.event.sig.slice(0, 6)}
                   </div>
@@ -90,11 +90,10 @@ export function LiveFeed() {
         </div>
       </GlassCard>
 
-      <div className="rounded-lg border border-amber-400/15 bg-amber-500/[0.04] px-3 py-2 text-[11px] text-amber-200/80 leading-relaxed">
-        <span className="font-mono text-amber-300/90">⚠ Sig column shows a mock hash, not a verified Schnorr signature.</span>{' '}
-        See <code className="font-mono text-amber-300">NIPS/30-synapse.md §6</code> for the cryptographic signing spec
-        — production deployment must use <code className="font-mono text-amber-300">@noble/curves</code> with
-        real Buzz agent keypairs.
+      <div className="rounded-lg border border-emerald-400/15 bg-emerald-500/[0.04] px-3 py-2 text-[11px] text-emerald-200/80 leading-relaxed">
+        <span className="font-mono text-emerald-300/90">Sig column shows the first 6 hex chars of the real BIP-340 Schnorr signature.</span>{' '}
+        Keys are derived via HKDF-SHA256 from agent names (<code className="font-mono text-emerald-300">nostr-tools v2 finalizeEvent</code>).
+        Set <code className="font-mono text-emerald-300">NOSTR_PRIVKEY</code> for a persistent primary agent key.
       </div>
     </div>
   );
